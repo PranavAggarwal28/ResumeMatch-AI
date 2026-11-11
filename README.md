@@ -26,6 +26,12 @@ From the project root, run:
 uv sync
 ```
 
+Or install the backend dependencies with pip:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 ### 2. Configure the Groq API key
 
 Create a `.env` file in the project root:
