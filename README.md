@@ -1,62 +1,90 @@
-# AI Resume Parser
+# AI Resume Parser API
 
-AI Resume Parser extracts candidate details from PDF and DOCX resumes, compares them with a job description, and reports match scores using the Groq API.
+A FastAPI backend that extracts structured information from PDF and DOCX resumes, compares candidates with a supplied job description, and returns ranked results using the Groq API.
 
 ## Features
 
-- Reads text from PDF and DOCX resumes.
-- Uses an LLM to structure job requirements and candidate experience.
-- Scores each candidate against the job description and summarizes matching skills, gaps, and experience.
-- Prints the two highest-scoring and two lowest-scoring candidates.
+- Accepts multiple PDF or DOCX resumes in one request.
+- Extracts job requirements and candidate details with an LLM.
+- Returns candidate match scores, skill matches and gaps, and an overall verdict.
+- Includes health status and interactive API documentation.
 
 ## Requirements
 
 - Python 3.14 or later
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) for dependency management
-- A Groq API key with access to the `openai/gpt-oss-120b` model
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- A Groq API key with access to `openai/gpt-oss-120b`
 
 ## How to use
 
-1. **Get the project and install its dependencies.** From the project directory, run:
+### 1. Install dependencies
 
-   ```bash
-   uv sync
-   ```
+From the project root, run:
 
-2. **Set your Groq API key.** Create a `.env` file in the project root with:
+```bash
+uv sync
+```
 
-   ```dotenv
-   GROQ_API_KEY=your_groq_api_key
-   ```
+### 2. Configure the Groq API key
 
-   The repository includes an `example_env` file you can use as a reference. Keep your real key private; `.env` is ignored by Git.
+Create a `.env` file in the project root:
 
-3. **Set the job description.** Open `ai_res_parse.py` and replace the text assigned to `job_description` with the role you want to hire for.
+```dotenv
+GROQ_API_KEY=your_groq_api_key
+```
 
-4. **Add resumes.** Put PDF or DOCX files in the `resumes/` folder. The script processes every supported file in that folder. It expects the folder to exist, and currently reads text-based PDFs (scanned PDFs without a text layer may not produce usable content).
+### 3. Start the API server
 
-5. **Run the parser** from the project root:
+```bash
+uv run uvicorn ai_resume_parser.api:app --reload
+```
 
-   ```bash
-   uv run python ai_res_parse.py
-   ```
+The API will be available at `http://127.0.0.1:8000`. Open `http://127.0.0.1:8000/docs` to try the endpoints interactively.
 
-   Results, including each candidate's score and match details, are printed in the terminal. The script does not currently save results to a file.
+### 4. Check the server
 
-## How it works
+```bash
+curl http://127.0.0.1:8000/health
+```
 
-The script first extracts structured requirements from the configured job description. It then extracts resume details for each supported file, compares each candidate with those requirements, sorts candidates by match score, and prints the top and bottom results. It pauses between Groq requests to reduce request bursts.
+Expected response:
+
+```json
+{"status":"ok"}
+```
+
+### 5. Parse and rank resumes
+
+Send the job description as a form field named `job_description` and attach one or more files using the `files` field:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/parse-resumes \
+  -F "job_description=Software engineer with Python, APIs, and distributed systems experience" \
+  -F "files=@resumes/Resume2.pdf" \
+  -F "files=@resumes/candidate.docx"
+```
+
+The endpoint returns structured job requirements and a `candidates` array sorted by score, highest first. It also includes `top_candidates` and `lowest_candidates` arrays. Each candidate entry contains the original filename, extracted resume data, score, and match details.
+
+Supported uploads are `.pdf` and `.docx`. Scanned PDFs without selectable text need OCR before upload. The API processes uploads in memory and does not save them to disk.
+
+## Endpoints
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Check that the API is running |
+| `POST` | `/api/v1/parse-resumes` | Parse resumes and return ranked candidate matches |
+
+Interactive OpenAPI documentation is available at `/docs` while the server is running.
+
+## Response shape
+
+The parse endpoint returns a JSON object with:
+
+- `job_requirements`: structured role, skills, experience, education, and responsibilities.
+- `candidates`: all analyzed resumes sorted by match score.
+- `top_candidates` and `lowest_candidates`: up to two candidates in each group.
 
 ## Privacy
 
-Resume text and the job description are sent to Groq for parsing and scoring. Only process resumes you are authorized to share with the configured service, and review its data handling terms before use.
-
-## Project layout
-
-```text
-.
-├── ai_res_parse.py   # Parsing, comparison, and batch-run workflow
-├── example_env       # Example environment variable names
-├── pyproject.toml    # Project metadata and dependencies
-└── resumes/          # Place PDF and DOCX resumes here
-```
+Extracted resume text and the job description are sent to Groq for analysis. Only submit resumes you are authorized to process, and review the provider's data handling terms before use.

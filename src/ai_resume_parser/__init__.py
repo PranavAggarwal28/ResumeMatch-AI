@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from ai-resume-parser!")
+"""AI Resume Parser package."""
