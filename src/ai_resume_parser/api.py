@@ -1,6 +1,7 @@
 """FastAPI backend for parsing resumes and comparing them with a job description."""
 
 import json
+import logging
 import os
 from functools import lru_cache
 from io import BytesIO
@@ -8,12 +9,15 @@ from io import BytesIO
 from dotenv import load_dotenv
 from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from groq import Groq
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 MODEL = "openai/gpt-oss-120b"
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
@@ -180,6 +184,18 @@ app = FastAPI(
     version="1.0.0",
 )
 
+frontend_origins = os.getenv(
+    "FRONTEND_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in frontend_origins.split(",") if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health", tags=["health"])
 def health_check() -> dict[str, str]:
@@ -203,10 +219,13 @@ def parse_resumes(
         job = extract_job_requirements(job_description)
     except HTTPException:
         raise
+
+
     except Exception as exc:
+        logger.exception("AI provider failed during job description analysis")
         raise HTTPException(
             status_code=502,
-            detail="Could not extract job requirements from the AI provider response.",
+            detail="AI analysis failed while reading the job description. Check the backend terminal for the provider error.",
         ) from exc
 
     try:
@@ -241,9 +260,10 @@ def parse_resumes(
             except HTTPException:
                 raise
             except Exception as exc:
+                logger.exception("AI provider failed during resume parsing or candidate scoring")
                 raise HTTPException(
                     status_code=502,
-                    detail=f"AI parsing or scoring failed for '{filename}'. Check the server logs and try again.",
+                    detail="AI analysis failed while parsing a resume or scoring a candidate. Check the backend terminal for the provider error.",
                 ) from exc
 
             candidates.append(
@@ -265,3 +285,150 @@ def parse_resumes(
         )
     except HTTPException:
         raise
+
+
+@app.post("/api/v1/parse-resumes/stream", tags=["resumes"])
+def parse_resumes_stream(
+    job_description: str = Form(..., min_length=20),
+    files: list[UploadFile] = File(..., min_length=1),
+) -> StreamingResponse:
+    """Stream per-stage and per-resume progress as server-sent events."""
+    job_description = job_description.strip()
+    if len(job_description) < 20:
+        raise HTTPException(
+            status_code=422,
+            detail="job_description must contain at least 20 non-whitespace characters.",
+        )
+
+    prepared_files: list[tuple[str, bytes]] = []
+    for upload in files:
+        filename = upload.filename or "unnamed-file"
+        suffix = os.path.splitext(filename)[1].lower()
+        if suffix not in SUPPORTED_EXTENSIONS:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Unsupported file type for '{filename}'. Upload PDF or DOCX files.",
+            )
+        content = upload.file.read()
+        if not content:
+            raise HTTPException(status_code=422, detail=f"'{filename}' is empty.")
+        prepared_files.append((filename, content))
+
+    def event(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def stream_events():
+        total_steps = 1 + 3 * len(prepared_files)
+        completed_steps = 0
+
+        def progress(stage: str, message: str, filename: str | None = None) -> dict:
+            return {
+                "type": "progress",
+                "stage": stage,
+                "message": message,
+                "filename": filename,
+                "completed_steps": completed_steps,
+                "total_steps": total_steps,
+                "percent": round(completed_steps / total_steps * 100),
+            }
+
+        yield event(progress("job_description", "Analyzing the job description"))
+        try:
+            job = extract_job_requirements(job_description)
+        except HTTPException as exc:
+            yield event({"type": "error", "message": exc.detail, "status": exc.status_code})
+            return
+        except Exception as exc:
+            logger.exception("AI provider failed during streamed job description analysis")
+            yield event({
+                "type": "error",
+                "message": "AI analysis failed while reading the job description. Check the backend terminal for the provider error.",
+                "status": 502,
+            })
+            return
+
+        completed_steps += 1
+        yield event(progress("job_description_complete", "Job description analyzed"))
+        candidates: list[CandidateResult] = []
+
+        for filename, content in prepared_files:
+            yield event(progress("reading_resume", f"Reading {filename}", filename))
+            try:
+                resume_text = extract_resume_text(filename, content)
+            except HTTPException as exc:
+                yield event({"type": "error", "message": exc.detail, "status": exc.status_code})
+                return
+            except Exception as exc:
+                logger.exception("Failed to extract text from uploaded resume")
+                yield event({
+                    "type": "error",
+                    "message": f"Could not read '{filename}'. Make sure it is a valid, unencrypted PDF or DOCX file.",
+                    "status": 422,
+                })
+                return
+
+            completed_steps += 1
+            yield event(progress("resume_read", f"Resume text extracted: {filename}", filename))
+            yield event(progress("parsing_resume", f"Parsing resume: {filename}", filename))
+            try:
+                resume = parse_resume(resume_text)
+            except HTTPException as exc:
+                yield event({"type": "error", "message": exc.detail, "status": exc.status_code})
+                return
+            except Exception as exc:
+                logger.exception("AI provider failed during streamed resume parsing")
+                yield event({
+                    "type": "error",
+                    "message": "AI analysis failed while parsing a resume. Check the backend terminal for the provider error.",
+                    "status": 502,
+                })
+                return
+
+            completed_steps += 1
+            candidate_name = resume.name or filename
+            yield event(progress("resume_parsed", f"Resume parsed: {candidate_name}", filename))
+            yield event(progress("scoring_resume", f"Scoring candidate: {candidate_name}", filename))
+            try:
+                match = score_resume(job, resume)
+            except HTTPException as exc:
+                yield event({"type": "error", "message": exc.detail, "status": exc.status_code})
+                return
+            except Exception as exc:
+                logger.exception("AI provider failed during streamed candidate scoring")
+                yield event({
+                    "type": "error",
+                    "message": "AI analysis failed while scoring a candidate. Check the backend terminal for the provider error.",
+                    "status": 502,
+                })
+                return
+
+            candidates.append(
+                CandidateResult(
+                    filename=filename,
+                    name=resume.name,
+                    score=match.score,
+                    details=match.details,
+                    resume=resume,
+                )
+            )
+            completed_steps += 1
+            yield event(progress("candidate_complete", f"Finished: {candidate_name}", filename))
+
+        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        response = ParseResumesResponse(
+            job_requirements=job,
+            candidates=candidates,
+            top_candidates=candidates[:2],
+            lowest_candidates=list(reversed(candidates[-2:])),
+        )
+        yield event({"type": "result", "data": response.model_dump(mode="json")})
+
+    return StreamingResponse(
+        stream_events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
